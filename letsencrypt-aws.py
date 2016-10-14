@@ -7,6 +7,7 @@ import time
 import acme.challenges
 import acme.client
 import acme.jose
+import acme.messages
 
 import click
 
@@ -61,10 +62,10 @@ def _get_iam_certificate(iam_client, certificate_id):
 
 
 class CertificateRequest(object):
-    def __init__(self, cert_location, dns_challenge_completer, hosts,
+    def __init__(self, cert_location, challenge_completer, hosts,
                  key_type):
         self.cert_location = cert_location
-        self.dns_challenge_completer = dns_challenge_completer
+        self.challenge_completer = challenge_completer
 
         self.hosts = hosts
         self.key_type = key_type
@@ -130,6 +131,19 @@ class ELBCertificate(object):
             LoadBalancerPort=self.elb_port,
         )
 
+
+class HTTPChallengeCompleter(object):
+    def __init__(self, path):
+        self.path = path
+
+    def create_file(self, uri, value):
+	fullpath = self.path + uri
+        directory = os.path.dirname(fullpath)
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+        f=open(self.path + uri, 'w')
+        f.write(value)
+        f.close()
 
 class Route53ChallengeCompleter(object):
     def __init__(self, route53_client):
@@ -245,6 +259,14 @@ def find_dns_challenge(authz):
         ):
             yield combo[0]
 
+def find_http_challenge(authz):
+    for combo in authz.body.resolved_combinations:
+        if (
+            len(combo) == 1 and
+            isinstance(combo[0].chall, acme.challenges.HTTP01)
+        ):
+            yield combo[0]
+
 
 def generate_certificate_name(hosts, cert):
     return "{serial}-{expiration}-{hosts}".format(
@@ -255,13 +277,41 @@ def generate_certificate_name(hosts, cert):
 
 
 class AuthorizationRecord(object):
-    def __init__(self, host, authz, dns_challenge, change_id):
+    def __init__(self, host, authz, challenge, extra):
         self.host = host
         self.authz = authz
-        self.dns_challenge = dns_challenge
-        self.change_id = change_id
+        self.challenge = challenge
+        self.extra = extra
 
+def start_http_challenge(logger, acme_client, http_challenge_completer,
+                        elb_name, host):
+    logger.emit(
+        "updating-elb.request-acme-challenge", elb_name=elb_name, host=host
+    )
 
+    authz = acme_client.request_domain_challenges(
+        host, acme_client.directory.new_authz
+    )
+
+    [http_challenge] = find_http_challenge(authz)
+
+    logger.emit(
+        "updating-elb.create-file", elb_name=elb_name, host=host
+    )
+
+    file_created = http_challenge_completer.create_file(
+        http_challenge.path,
+        http_challenge.validation(acme_client.key),
+    )
+
+    return AuthorizationRecord(
+        host,
+        authz,
+        http_challenge,
+        file_created,
+    )
+
+ 
 def start_dns_challenge(logger, acme_client, dns_challenge_completer,
                         elb_name, host):
     logger.emit(
@@ -276,6 +326,7 @@ def start_dns_challenge(logger, acme_client, dns_challenge_completer,
     logger.emit(
         "updating-elb.create-txt-record", elb_name=elb_name, host=host
     )
+
     change_id = dns_challenge_completer.create_txt_record(
         dns_challenge.validation_domain_name(host),
         dns_challenge.validation(acme_client.key),
@@ -288,6 +339,31 @@ def start_dns_challenge(logger, acme_client, dns_challenge_completer,
         change_id,
     )
 
+def complete_http_challenge(logger, acme_client, http_challenge_completer,
+                           elb_name, authz_record):
+    logger.emit(
+        "updating-elb.wait-for-route53",
+        elb_name=elb_name, host=authz_record.host
+    )
+    response = authz_record.challenge.response(acme_client.key)
+    logger.emit(
+        "updating-elb.local-validation",
+        elb_name=elb_name, host=authz_record.host
+    )
+    verified = response.simple_verify(
+        authz_record.challenge.chall,
+        authz_record.host,
+        acme_client.key.public_key()
+    )
+    if not verified:
+        raise ValueError("Failed verification")
+
+    logger.emit(
+        "updating-elb.answer-challenge",
+        elb_name=elb_name, host=authz_record.host
+    )
+    acme_client.answer_challenge(authz_record.challenge, response)
+
 
 def complete_dns_challenge(logger, acme_client, dns_challenge_completer,
                            elb_name, authz_record):
@@ -297,7 +373,7 @@ def complete_dns_challenge(logger, acme_client, dns_challenge_completer,
     )
     dns_challenge_completer.wait_for_change(authz_record.change_id)
 
-    response = authz_record.dns_challenge.response(acme_client.key)
+    response = authz_record.challenge.response(acme_client.key)
 
     logger.emit(
         "updating-elb.local-validation",
@@ -315,7 +391,7 @@ def complete_dns_challenge(logger, acme_client, dns_challenge_completer,
         "updating-elb.answer-challenge",
         elb_name=elb_name, host=authz_record.host
     )
-    acme_client.answer_challenge(authz_record.dns_challenge, response)
+    acme_client.answer_challenge(authz_record.challenge, response)
 
 
 def request_certificate(logger, acme_client, elb_name, authorizations, csr):
@@ -388,17 +464,29 @@ def update_cert(logger, acme_client, force_issue, cert_request):
     authorizations = []
     try:
         for host in cert_request.hosts:
-            authz_record = start_dns_challenge(
-                logger, acme_client, cert_request.dns_challenge_completer,
-                cert_request.cert_location.elb_name, host,
-            )
+            if type(cert_request.challenge_completer) == Route53ChallengeCompleter:
+                authz_record = start_dns_challenge(
+                    logger, acme_client, cert_request.challenge_completer,
+                    cert_request.cert_location.elb_name, host,
+                )
+            elif type(cert_request.challenge_completer) == HTTPChallengeCompleter:
+                authz_record = start_http_challenge(
+                    logger, acme_client, cert_request.challenge_completer,
+                    cert_request.cert_location.elb_name, host,
+                )
             authorizations.append(authz_record)
 
         for authz_record in authorizations:
-            complete_dns_challenge(
-                logger, acme_client, cert_request.dns_challenge_completer,
-                cert_request.cert_location.elb_name, authz_record
-            )
+            if type(cert_request.challenge_completer) == Route53ChallengeCompleter:
+                complete_dns_challenge(
+                    logger, acme_client, cert_request.challenge_completer,
+                    cert_request.cert_location.elb_name, authz_record
+                )
+            elif type(cert_request.challenge_completer) == HTTPChallengeCompleter:
+                complete_http_challenge(
+                    logger, acme_client, cert_request.challenge_completer,
+                    cert_request.cert_location.elb_name, authz_record
+                )
 
         pem_certificate, pem_certificate_chain = request_certificate(
             logger, acme_client, cert_request.cert_location.elb_name,
@@ -411,17 +499,21 @@ def update_cert(logger, acme_client, force_issue, cert_request):
         )
     finally:
         for authz_record in authorizations:
-            logger.emit(
-                "updating-elb.delete-txt-record",
-                elb_name=cert_request.cert_location.elb_name,
-                host=authz_record.host
-            )
-            dns_challenge = authz_record.dns_challenge
-            cert_request.dns_challenge_completer.delete_txt_record(
-                authz_record.change_id,
-                dns_challenge.validation_domain_name(authz_record.host),
-                dns_challenge.validation(acme_client.key),
-            )
+            if type(cert_request.challenge_completer) == Route53ChallengeCompleter:
+                logger.emit(
+                    "updating-elb.delete-txt-record",
+                    elb_name=cert_request.cert_location.elb_name,
+                    host=authz_record.host
+                )
+                dns_challenge = authz_record.challenge
+                cert_request.challenge_completer.delete_txt_record(
+                    authz_record.change_id,
+                    dns_challenge.validation_domain_name(authz_record.host),
+                    dns_challenge.validation(acme_client.key),
+                )
+            elif type(cert_request.challenge_completer) == HTTPChallengeCompleter:
+                logger.emit("removing challenge file")
+                #TODO: do it :)
 
 
 def update_certs(logger, acme_client, force_issue, certificate_requests):
@@ -477,12 +569,15 @@ def cli():
     "--persistent", is_flag=True, help="Runs in a loop, instead of just once."
 )
 @click.option(
+    "--http-challenge", is_flag=True, help="Use http challenge instead of Route53."
+)
+@click.option(
     "--force-issue", is_flag=True, help=(
         "Issue a new certificate, even if the old one isn't close to "
         "expiration."
     )
 )
-def update_certificates(persistent=False, force_issue=False):
+def update_certificates(persistent=False, force_issue=False, http_challenge=False):
     logger = Logger()
     logger.emit("startup")
 
@@ -492,10 +587,22 @@ def update_certificates(persistent=False, force_issue=False):
     session = boto3.Session()
     s3_client = session.client("s3")
     elb_client = session.client("elb")
-    route53_client = session.client("route53")
+    if not http_challenge:
+        route53_client = session.client("route53")
+    else:
+        route53_client = None
     iam_client = session.client("iam")
 
     config = json.loads(os.environ["LETSENCRYPT_AWS_CONFIG"])
+    if http_challenge and not 'path' in config:
+        raise ValueError("you have to specify a path in the config if you want to use the http_challenge")
+    elif http_challenge:
+        path = config["path"]
+        challenger = HTTPChallengeCompleter(path)
+    else:
+        path = None
+        challenger = Route53ChallengeCompleter(route53_client)
+ 
     domains = config["domains"]
     acme_directory_url = config.get(
         "acme_directory_url", DEFAULT_ACME_DIRECTORY_URL
@@ -519,7 +626,7 @@ def update_certificates(persistent=False, force_issue=False):
 
         certificate_requests.append(CertificateRequest(
             cert_location,
-            Route53ChallengeCompleter(route53_client),
+            challenger,
             domain["hosts"],
             domain.get("key_type", "rsa"),
         ))
