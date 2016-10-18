@@ -137,13 +137,14 @@ class HTTPChallengeCompleter(object):
         self.path = path
 
     def create_file(self, uri, value):
-	fullpath = self.path + uri
+        fullpath = self.path + uri
         directory = os.path.dirname(fullpath)
         if not os.path.exists(directory):
             os.makedirs(directory)
-        f=open(self.path + uri, 'w')
+        f=open(fullpath, 'w')
         f.write(value)
         f.close()
+        return fullpath
 
 class Route53ChallengeCompleter(object):
     def __init__(self, route53_client):
@@ -371,7 +372,7 @@ def complete_dns_challenge(logger, acme_client, dns_challenge_completer,
         "updating-elb.wait-for-route53",
         elb_name=elb_name, host=authz_record.host
     )
-    dns_challenge_completer.wait_for_change(authz_record.change_id)
+    dns_challenge_completer.wait_for_change(authz_record.extra)
 
     response = authz_record.challenge.response(acme_client.key)
 
@@ -380,7 +381,7 @@ def complete_dns_challenge(logger, acme_client, dns_challenge_completer,
         elb_name=elb_name, host=authz_record.host
     )
     verified = response.simple_verify(
-        authz_record.dns_challenge.chall,
+        authz_record.challenge.chall,
         authz_record.host,
         acme_client.key.public_key()
     )
@@ -507,13 +508,17 @@ def update_cert(logger, acme_client, force_issue, cert_request):
                 )
                 dns_challenge = authz_record.challenge
                 cert_request.challenge_completer.delete_txt_record(
-                    authz_record.change_id,
+                    authz_record.extra,
                     dns_challenge.validation_domain_name(authz_record.host),
                     dns_challenge.validation(acme_client.key),
                 )
             elif type(cert_request.challenge_completer) == HTTPChallengeCompleter:
-                logger.emit("removing challenge file")
-                #TODO: do it :)
+                logger.emit(
+                    "updatating.delete-challenge-file",
+                    elb_name=cert_request.cert_location.elb_name,
+                    host=authz_record.host
+                )
+                os.remove(authz_record.extra)
 
 
 def update_certs(logger, acme_client, force_issue, certificate_requests):
@@ -569,34 +574,41 @@ def cli():
     "--persistent", is_flag=True, help="Runs in a loop, instead of just once."
 )
 @click.option(
-    "--http-challenge", is_flag=True, help="Use http challenge instead of Route53."
-)
-@click.option(
     "--force-issue", is_flag=True, help=(
         "Issue a new certificate, even if the old one isn't close to "
         "expiration."
     )
 )
-def update_certificates(persistent=False, force_issue=False, http_challenge=False):
+def update_certificates(persistent=False, force_issue=False):
     logger = Logger()
     logger.emit("startup")
 
     if persistent and force_issue:
         raise ValueError("Can't specify both --persistent and --force-issue")
 
+    config = json.loads(os.environ["LETSENCRYPT_AWS_CONFIG"])
+
+    if "challenge" in config:
+        if config["challenge"] == "http":
+            challenge = "http"
+        else:
+            challenge = "dns"
+    else:
+        challenge = "dns"
+
     session = boto3.Session()
     s3_client = session.client("s3")
     elb_client = session.client("elb")
-    if not http_challenge:
+    iam_client = session.client("iam")
+
+    if challenge == "dns":
         route53_client = session.client("route53")
     else:
         route53_client = None
-    iam_client = session.client("iam")
 
-    config = json.loads(os.environ["LETSENCRYPT_AWS_CONFIG"])
-    if http_challenge and not 'path' in config:
+    if challenge == "http" and not "path" in config:
         raise ValueError("you have to specify a path in the config if you want to use the http_challenge")
-    elif http_challenge:
+    elif challenge == "http"
         path = config["path"]
         challenger = HTTPChallengeCompleter(path)
     else:
