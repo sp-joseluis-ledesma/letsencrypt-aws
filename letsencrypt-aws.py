@@ -608,7 +608,7 @@ def update_certificates(persistent=False, force_issue=False):
 
     if challenge == "http" and not "path" in config:
         raise ValueError("you have to specify a path in the config if you want to use the http_challenge")
-    elif challenge == "http"
+    elif challenge == "http":
         path = config["path"]
         challenger = HTTPChallengeCompleter(path)
     else:
